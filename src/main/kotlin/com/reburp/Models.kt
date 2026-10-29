@@ -654,6 +654,32 @@ data class SendToRepeaterRequest(
 )
 
 @Serializable
+data class RepeaterProofRequest(
+    /** Raw HTTP request. These bytes are what Repeater shows and sends. */
+    val raw_request: String,
+    /** Repeater tab label. A new tab is appended; other tabs are left in place. */
+    val tab_name: String? = null,
+    /** Optional ASCII substring that must appear in the response editor. */
+    val expect: String? = null,
+    /** How long to wait for the response editor to become non-empty. */
+    val timeout_ms: Long? = null,
+)
+
+@Serializable
+data class RepeaterProofResponse(
+    val tab_name: String,
+    val response: String,
+    val elapsed_ms: Long,
+    val png_base64: String,
+)
+
+@Serializable
+data class RepeaterProofError(
+    val error: String,
+    val response: String? = null,
+)
+
+@Serializable
 data class SendToIntruderRequest(
     /**
      * Raw HTTP request string. Mark payload insertion points by surrounding them with § symbols
