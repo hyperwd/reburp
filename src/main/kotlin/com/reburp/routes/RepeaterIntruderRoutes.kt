@@ -10,12 +10,9 @@ import io.ktor.server.routing.*
 import java.awt.Component
 import java.awt.Container
 import java.awt.Frame
-import java.awt.image.BufferedImage
-import java.io.ByteArrayOutputStream
 import java.util.Base64
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
-import javax.imageio.ImageIO
 import javax.swing.AbstractButton
 import javax.swing.JTabbedPane
 import javax.swing.SwingUtilities
@@ -93,6 +90,10 @@ fun Routing.repeaterIntruderRoutes(api: MontoyaApi) {
         if (req.raw_request.isBlank()) {
             return@post call.respond(HttpStatusCode.BadRequest, RepeaterProofError("bad_request"))
         }
+        val expect = req.expect?.trim().orEmpty()
+        if (expect.isEmpty()) {
+            return@post call.respond(HttpStatusCode.BadRequest, RepeaterProofError("expect_required"))
+        }
         val tabName = req.tab_name?.trim()?.takeIf { it.isNotEmpty() }
             ?: "proof-${System.currentTimeMillis() % 1_000_000}"
         val timeout = (req.timeout_ms ?: 20_000L).coerceIn(1_000L, 120_000L)
@@ -102,11 +103,12 @@ fun Routing.repeaterIntruderRoutes(api: MontoyaApi) {
         }.getOrElse {
             return@post call.respond(HttpStatusCode.BadRequest, RepeaterProofError("bad_request", it.message))
         }
-        val result = runCatching { runRepeaterProof(api, httpReq, tabName, req.expect, timeout) }
+        val result = runCatching { runRepeaterProof(api, httpReq, tabName, expect, timeout) }
         result.onSuccess {
             call.respond(
                 RepeaterProofResponse(
                     tab_name = it.tabName,
+                    request = it.request,
                     response = it.response,
                     elapsed_ms = it.elapsedMs,
                     png_base64 = Base64.getEncoder().encodeToString(it.png),
@@ -189,7 +191,13 @@ fun Routing.repeaterIntruderRoutes(api: MontoyaApi) {
     }
 }
 
-private class ProofShot(val tabName: String, val response: String, val elapsedMs: Long, val png: ByteArray)
+private class ProofShot(
+    val tabName: String,
+    val request: String,
+    val response: String,
+    val elapsedMs: Long,
+    val png: ByteArray,
+)
 
 private class ProofFail(
     val error: String,
@@ -201,7 +209,7 @@ private fun runRepeaterProof(
     api: MontoyaApi,
     httpReq: HttpRequest,
     tabName: String,
-    expect: String?,
+    expect: String,
     timeoutMs: Long,
 ): ProofShot {
     val beforeCount = onEdt {
@@ -239,29 +247,27 @@ private fun runRepeaterProof(
     }
     val (t0, before) = clickedAt
     val deadline = System.currentTimeMillis() + timeoutMs
-    var response: String? = null
+    var sent: Pair<String, String>? = null
     while (System.currentTimeMillis() < deadline) {
         val hit = onEdt {
             val scope = repeaterToolPanel(api) ?: return@onEdt null
-            editorTexts(scope).firstOrNull { text ->
-                text.trimStart().startsWith("HTTP/") && text !in before
-            }
+            readSentEditors(scope)?.takeIf { (_, response) -> response !in before }
         }
         if (hit != null) {
-            response = hit
+            sent = hit
             break
         }
         Thread.sleep(100)
     }
     val elapsed = (System.nanoTime() - t0) / 1_000_000
-    val body = response ?: throw ProofFail("send_timeout", HttpStatusCode.GatewayTimeout)
-    if (!expect.isNullOrEmpty() && !body.contains(expect)) {
-        throw ProofFail("expect_mismatch", HttpStatusCode.Conflict, body)
+    val (requestText, responseText) = sent ?: throw ProofFail("send_timeout", HttpStatusCode.GatewayTimeout)
+    if (!responseText.contains(expect)) {
+        throw ProofFail("expect_mismatch", HttpStatusCode.Conflict, responseText)
     }
-    val png = runCatching { captureSuiteFrame(api) }.getOrElse {
-        throw ProofFail("capture_failed", HttpStatusCode.InternalServerError, body)
+    val png = runCatching { captureSuiteWindow(api) }.getOrElse {
+        throw ProofFail("capture_failed", HttpStatusCode.InternalServerError, responseText)
     }
-    return ProofShot(tabName, body, elapsed, png)
+    return ProofShot(tabName, requestText, responseText, elapsed, png)
 }
 
 private fun showRepeater(frame: Frame) {
@@ -322,6 +328,8 @@ private fun activateSend(control: Component, scope: java.awt.Container) {
     clickAt(target, pt.x, pt.y, "left", 1)
 }
 
+private val requestStart = Regex("""(?i)^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|TRACE)\s+\S+""")
+
 private fun editorTexts(root: Component): List<String> =
     walkTree(root).mapNotNull { c ->
         if (c !is JTextComponent) return@mapNotNull null
@@ -330,26 +338,94 @@ private fun editorTexts(root: Component): List<String> =
         runCatching { c.document.getText(0, n) }.getOrNull()
     }.toList()
 
-private fun captureSuiteFrame(api: MontoyaApi): ByteArray {
-    // Render the suite frame off-screen. java.awt.Robot reads the compositor's screen
-    // buffer, which is black on this machine even when the window is showing, so a
-    // Robot capture cannot be the evidence. printAll is the frame's own pixels.
-    val img = onEdt {
+/** Request and response editor text after Send. Not the caller's raw input. */
+private fun readSentEditors(scope: Component): Pair<String, String>? {
+    val splits = walkTree(scope).filterIsInstance<javax.swing.JSplitPane>()
+        .filter { it.orientation == javax.swing.JSplitPane.HORIZONTAL_SPLIT }
+    for (split in splits) {
+        val left = editorTexts(split.leftComponent ?: continue).maxByOrNull { it.length } ?: continue
+        val right = editorTexts(split.rightComponent ?: continue).maxByOrNull { it.length } ?: continue
+        pairedEditors(left, right)?.let { return it }
+    }
+    // Burp's message editors are not always the two sides of one JSplitPane.
+    val texts = editorTexts(scope)
+    val request = texts.filter { looksLikeRequest(it) }.maxByOrNull { it.length }
+    val response = texts.filter { it.trimStart().startsWith("HTTP/") }.maxByOrNull { it.length }
+    if (request != null && response != null) return request to response
+    return null
+}
+
+private fun pairedEditors(a: String, b: String): Pair<String, String>? = when {
+    looksLikeRequest(a) && b.trimStart().startsWith("HTTP/") -> a to b
+    looksLikeRequest(b) && a.trimStart().startsWith("HTTP/") -> b to a
+    else -> null
+}
+
+private fun looksLikeRequest(text: String): Boolean {
+    val first = text.trimStart().lineSequence().firstOrNull()?.trim().orEmpty()
+    return requestStart.containsMatchIn(first)
+}
+
+/**
+ * Window-level capture of the Burp suite frame only. `import -window` reads that
+ * X window (plus its frame), not the root screen, so the PNG cannot contain the
+ * wallpaper, other windows, or the taskbar. printAll is not used: it is a Swing
+ * repaint of the client area and can drop pieces of the real window.
+ */
+private fun captureSuiteWindow(api: MontoyaApi): ByteArray {
+    val wid = onEdt {
         val frame = suiteFrame(api) ?: throw ProofFail("capture_failed", HttpStatusCode.InternalServerError)
         frame.extendedState = frame.extendedState or Frame.MAXIMIZED_BOTH
         frame.toFront()
-        val w = frame.width
-        val h = frame.height
-        if (w < 200 || h < 200) throw ProofFail("capture_failed", HttpStatusCode.InternalServerError)
-        val image = BufferedImage(w, h, BufferedImage.TYPE_INT_RGB)
-        val g = image.createGraphics()
-        frame.printAll(g)
-        g.dispose()
-        image
+        if (frame.width < 200 || frame.height < 200) {
+            throw ProofFail("capture_failed", HttpStatusCode.InternalServerError)
+        }
+        xWindowId(frame)
     }
-    val out = ByteArrayOutputStream()
-    if (!ImageIO.write(img, "png", out) || out.size() < 1024) {
+    Thread.sleep(400)
+    val tmp = java.io.File.createTempFile("reburp-proof-", ".png")
+    try {
+        val proc = ProcessBuilder("import", "-window", wid, "-frame", tmp.absolutePath)
+            .redirectErrorStream(true)
+            .start()
+        if (!proc.waitFor(8, java.util.concurrent.TimeUnit.SECONDS) || proc.exitValue() != 0) {
+            throw ProofFail("capture_failed", HttpStatusCode.InternalServerError)
+        }
+        val bytes = tmp.readBytes()
+        if (bytes.size < 1024 || !bytes.copyOfRange(0, minOf(8, bytes.size)).contentEquals(byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A))) {
+            throw ProofFail("capture_failed", HttpStatusCode.InternalServerError)
+        }
+        return bytes
+    } finally {
+        tmp.delete()
+    }
+}
+
+private fun xWindowId(frame: Frame): String {
+    val fromPeer = runCatching { peerWindowId(frame) }.getOrNull()
+    if (fromPeer != null && fromPeer > 0) return fromPeer.toString()
+    val title = frame.title?.trim().orEmpty()
+    if (title.isEmpty()) throw ProofFail("capture_failed", HttpStatusCode.InternalServerError)
+    val proc = ProcessBuilder("xdotool", "search", "--name", title)
+        .redirectErrorStream(true)
+        .start()
+    val text = proc.inputStream.bufferedReader().readText()
+    if (!proc.waitFor(3, java.util.concurrent.TimeUnit.SECONDS) || proc.exitValue() != 0) {
         throw ProofFail("capture_failed", HttpStatusCode.InternalServerError)
     }
-    return out.toByteArray()
+    val id = text.lineSequence().mapNotNull { it.trim().toLongOrNull() }.lastOrNull()
+        ?: throw ProofFail("capture_failed", HttpStatusCode.InternalServerError)
+    return id.toString()
+}
+
+private fun peerWindowId(frame: Frame): Long {
+    val field = java.awt.Component::class.java.getDeclaredField("peer")
+    field.isAccessible = true
+    val peer = field.get(frame) ?: return 0L
+    val method = peer.javaClass.methods.firstOrNull { it.name == "getWindow" && it.parameterCount == 0 } ?: return 0L
+    return when (val v = method.invoke(peer)) {
+        is Long -> v
+        is Int -> v.toLong() and 0xffffffffL
+        else -> 0L
+    }
 }

@@ -659,7 +659,7 @@ data class RepeaterProofRequest(
     val raw_request: String,
     /** Repeater tab label. A new tab is appended; other tabs are left in place. */
     val tab_name: String? = null,
-    /** Optional ASCII substring that must appear in the response editor. */
+    /** Required ASCII substring. The response editor must contain it or the call fails with no PNG. */
     val expect: String? = null,
     /** How long to wait for the response editor to become non-empty. */
     val timeout_ms: Long? = null,
@@ -668,6 +668,9 @@ data class RepeaterProofRequest(
 @Serializable
 data class RepeaterProofResponse(
     val tab_name: String,
+    /** Left editor after Send — Burp's actual request, not the caller's input. */
+    val request: String,
+    /** Right editor after Send. */
     val response: String,
     val elapsed_ms: Long,
     val png_base64: String,
